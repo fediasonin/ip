@@ -1,18 +1,20 @@
 # merge_geoip.py
 """
-Скрипт склеивает два CSV‑файла из geoip.noc.gov.ru (locations + blocks)
-и выпускает аккуратный итоговый CSV c колонками:
-    _last_changed, network, start_ip, end_ip, code, name
-как на листе «Итог» вашего IP.xlsx.
+Скрипт склеивает два CSV‑файла geoip.noc.gov.ru (locations + blocks)
+и выдаёт итоговый CSV с колонками:
+    _last_changed, network, start_ip, end_ip, from, to, code, name
+
+Оптимизировано: расчёт диапазонов CIDR теперь делается **векторно** без
+долгого `apply`, так что даже 350k+ сетей обрабатываются за считанные
+секунды.
 
 Запуск:
     python merge_geoip.py <locations.csv> <blocks.csv> <output.csv> [дата]
 
-Где **дата** (необязательный 4‑й аргумент) — время выгрузки в формате
-`дд.мм.гггг чч:мм:сс`. Если не указан, скрипт спросит его интерактивно,
-а при пустом вводе проставит текущее время.
+Дата (4‑й аргумент, опционально) — `дд.мм.гггг чч:мм:сс`. Если пропустить —
+спросит, Enter = текущее время.
 
-Зависимости: `pandas ≥ 1.5`  → `pip install pandas`
+Зависимости: `pandas>=1.5` (pip install -r requirements.txt)
 """
 
 from __future__ import annotations
@@ -25,9 +27,11 @@ from pathlib import Path
 
 import pandas as _pd
 
+# ────────────────────────────────────────────────────────────────────────────────
+#  Helpers
+# ────────────────────────────────────────────────────────────────────────────────
 
 def _load_locations(path: Path) -> dict[int, tuple[str, str]]:
-    """Возвращает словарь geoname_id → (ISO‑код, название страны)."""
     df = _pd.read_csv(path, dtype="string")
     return {
         int(row.geoname_id): (row.country_iso_code, row.country_name)
@@ -35,28 +39,31 @@ def _load_locations(path: Path) -> dict[int, tuple[str, str]]:
     }
 
 
-def _calc_ip_range(cidr: str) -> tuple[str, str]:
-    """Возвращает (start_ip, end_ip) для сети в CIDR‑нотации."""
-    net = _ip.ip_network(cidr, strict=False)
-    return str(net.network_address), str(net.broadcast_address)
+def _cidr_to_bounds_vec(cidr_series: _pd.Series) -> tuple[list[str], list[str]]:
+    """Быстрый векторный расчёт start/end IP для колонок в CIDR‑формате."""
+    starts: list[str] = []
+    ends: list[str] = []
+    append_s = starts.append
+    append_e = ends.append
+    for net_str in cidr_series.tolist():
+        net = _ip.ip_network(net_str, strict=False)
+        append_s(str(net.network_address))
+        append_e(str(net.broadcast_address))
+    return starts, ends
+
+
+def _ip_to_decimal_vec(ip_list: list[str]) -> list[int]:
+    return [int(_ip.IPv4Address(ip)) for ip in ip_list]
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-#  Core routine
+#  Core merge
 # ────────────────────────────────────────────────────────────────────────────────
 
-def merge(
-    locations_csv: str | Path,
-    blocks_csv: str | Path,
-    timestamp: str,
-) -> _pd.DataFrame:
-
-    locations_map = _load_locations(Path(locations_csv))
-
-    # Подавляем DtypeWarning (pandas генерирует его ДО обработки наших dtypes)
+def merge(locations_csv: Path, blocks_csv: Path, timestamp: str) -> _pd.DataFrame:
+    loc_map = _load_locations(locations_csv)
     warnings.filterwarnings("ignore", category=_pd.errors.DtypeWarning)
 
-    # Читаем всё как строки, чтобы не споткнуться о пробелы и прочий мусор
     blocks = _pd.read_csv(
         blocks_csv,
         dtype="string",
@@ -65,84 +72,66 @@ def merge(
         low_memory=False,
     )
 
-    int_cols = [
-        "geoname_id",
-        "registered_country_geoname_id",
-        "represented_country_geoname_id",
-        "is_anonymous_proxy",
-        "is_satellite_provider",
-        "is_anycast",
-    ]
-
-    for col in int_cols:
-        if col in blocks.columns:
-            blocks[col] = _pd.to_numeric(blocks[col], errors="coerce").astype("Int64")
-
-    def _lookup_country(row):
+    # country lookup
+    def _lookup(row):
         for key in (
             row.geoname_id,
             row.registered_country_geoname_id,
             row.represented_country_geoname_id,
         ):
-            if not _pd.isna(key) and int(key) in locations_map:
-                return locations_map[int(key)]
+            if key and key.isdigit() and int(key) in loc_map:
+                return loc_map[int(key)]
         return (None, None)
 
-    blocks[["code", "name"]] = blocks.apply(
-        lambda r: _pd.Series(_lookup_country(r)), axis=1
-    )
+    blocks[["code", "name"]] = blocks.apply(lambda r: _pd.Series(_lookup(r)), axis=1)
 
-    blocks[["start_ip", "end_ip"]] = blocks["network"].apply(
-        lambda cidr: _pd.Series(_calc_ip_range(cidr))
-    )
+    # vectorised cidr → start/end
+    starts, ends = _cidr_to_bounds_vec(blocks["network"])
+    blocks["start_ip"] = starts
+    blocks["end_ip"] = ends
+
+    # vectorised decimal conversion
+    blocks["from"] = _ip_to_decimal_vec(starts)
+    blocks["to"] = _ip_to_decimal_vec(ends)
 
     blocks["_last_changed"] = timestamp
 
-    result = blocks[
-        ["_last_changed", "network", "start_ip", "end_ip", "code", "name"]
-    ].fillna("").copy()
-
-    return result
+    return blocks[
+        ["_last_changed", "network", "start_ip", "end_ip", "from", "to", "code", "name"]
+    ].fillna("")
 
 
-def _ask_timestamp() -> str:
-    """Интерактивно спрашивает время выгрузки."""
-    user_input = input(
-        "Укажи время выгрузки в формате дд.мм.гггг чч:мм:сс "
-        "[Enter — текущее]: "
-    ).strip()
-    return user_input
+# ────────────────────────────────────────────────────────────────────────────────
+#  CLI
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _ask_ts() -> str:
+    return input("Дата выгрузки (дд.мм.гггг чч:мм:сс) [Enter — сейчас]: ").strip()
 
 
-def _validate_timestamp(ts: str) -> str:
-    """Проверяет формат и возвращает строку‑штамп."""
+def _norm_ts(ts: str) -> str:
     if not ts:
         return _dt.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     try:
         _dt.datetime.strptime(ts, "%d.%m.%Y %H:%M:%S")
         return ts
-    except ValueError as exc:
-        print(f"✗ Неверный формат даты/времени: {exc}", file=sys.stderr)
+    except ValueError:
+        print("✗ Неверный формат даты", file=sys.stderr)
         sys.exit(2)
 
 
 def _cli():
     if len(sys.argv) not in (4, 5):
-        print(
-            "Usage: python merge_geoip.py <locations.csv> <blocks.csv> "
-            "<output.csv> [дд.мм.гггг чч:мм:сс]",
-            file=sys.stderr,
-        )
+        print("Usage: python merge_geoip.py <loc.csv> <blocks.csv> <out.csv> [date]", file=sys.stderr)
         sys.exit(1)
 
-    locations_csv, blocks_csv, output_csv = map(Path, sys.argv[1:4])
+    loc_csv, blk_csv, out_csv = map(Path, sys.argv[1:4])
+    ts_raw = sys.argv[4] if len(sys.argv) == 5 else _ask_ts()
+    ts = _norm_ts(ts_raw)
 
-    timestamp_raw = sys.argv[4] if len(sys.argv) == 5 else _ask_timestamp()
-    timestamp = _validate_timestamp(timestamp_raw)
-
-    df = merge(locations_csv, blocks_csv, timestamp)
-    df.to_csv(output_csv, index=False)
-    print(f"✓ Готово. Итоговый файл сохранён в {output_csv}")
+    df = merge(loc_csv, blk_csv, ts)
+    df.to_csv(out_csv, index=False)
+    print(f"✓ Итоговый файл сохранён: {out_csv}")
 
 
 if __name__ == "__main__":
